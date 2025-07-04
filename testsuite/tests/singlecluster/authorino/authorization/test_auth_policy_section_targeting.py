@@ -1,15 +1,9 @@
 """Tests that the AuthPolicy is correctly applied to the chosen Gateway Listener"""
 
 import pytest
-from testsuite.httpx.auth import HttpxOidcClientAuth
 from testsuite.kuadrant.policy.authorization.auth_policy import AuthPolicy
 
 pytestmark = [pytest.mark.kuadrant_only, pytest.mark.authorino]
-
-@pytest.fixture(scope="module")
-def auth(oidc_provider):
-    """Returns authentication object that provides oidc token to HTTP requests"""
-    return HttpxOidcClientAuth(oidc_provider.get_token, "authorization")
 
 
 @pytest.fixture(scope="module")
