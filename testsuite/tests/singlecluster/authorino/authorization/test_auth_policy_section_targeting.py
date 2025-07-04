@@ -5,7 +5,6 @@ from testsuite.kuadrant.policy.authorization.auth_policy import AuthPolicy
 
 pytestmark = [pytest.mark.kuadrant_only, pytest.mark.authorino]
 
-
 @pytest.fixture(scope="module")
 def auth_policy(cluster, blame, module_label, gateway, oidc_provider):
     """Creates an AuthPolicy tht targets a specific Gateway Listener, policy is applied only to 'api' listener"""
