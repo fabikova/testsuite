@@ -3,7 +3,8 @@ Tests that the AuthPolicy is correctly applied only to requests matching a speci
 on a specific Gateway listener section using the 'sectionName' field.
 
 Thus:
-- The policy does not apply globally to all listeners
+- The policy applies only to the 'api' listener on the Gateway
+- The policy does not apply globally to all Gateway listeners or the HTTPRoute sections
 - CEL predicates further restrict the policy scope (e.g. only for '/get' path)
 """
 
