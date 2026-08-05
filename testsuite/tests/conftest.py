@@ -24,6 +24,7 @@ from testsuite.oidc.keycloak import Keycloak
 from testsuite.tracing.jaeger import JaegerClient
 from testsuite.tracing.tempo import RemoteTempoClient
 from testsuite.utils import randomize, _whoami
+from testsuite.utils.resource_collector import collect_resources
 
 
 def pytest_addoption(parser):
@@ -34,6 +35,12 @@ def pytest_addoption(parser):
     parser.addoption("--standalone", action="store_true", default=False, help="Runs testsuite in standalone mode")
     parser.addoption(
         "--verify-denials", default="true", help="Verifies that denied requests did not leak to the upstream backend"
+    )
+    parser.addoption(
+        "--collect-resources",
+        action="store_true",
+        default=False,
+        help="Collect and save all test resources to debug-resources/",
     )
 
 
@@ -450,6 +457,13 @@ def check_min_ocp_version(request, openshift_version):
             pytest.skip("Could not detect OpenShift version")
         if openshift_version < required_version:
             pytest.skip(f"Requires OCP {'.'.join(map(str, required_version))}+")
+
+
+@pytest.fixture(scope="function", autouse=True)
+def collect_test_resources(request, module_label):
+    """Collect module resources after all tests in the module finish."""
+    yield
+    collect_resources(request.node, module_label)
 
 
 @pytest.fixture(autouse=True)
