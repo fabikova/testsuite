@@ -2,6 +2,7 @@
 
 import operator
 import signal
+from datetime import datetime
 from urllib.parse import urlparse
 
 import pytest
@@ -24,7 +25,7 @@ from testsuite.oidc.keycloak import Keycloak
 from testsuite.tracing.jaeger import JaegerClient
 from testsuite.tracing.tempo import RemoteTempoClient
 from testsuite.utils import randomize, _whoami
-from testsuite.utils.resource_collector import collect_resources
+from testsuite.utils import resource_collector
 
 
 def pytest_addoption(parser):
@@ -459,11 +460,99 @@ def check_min_ocp_version(request, openshift_version):
             pytest.skip(f"Requires OCP {'.'.join(map(str, required_version))}+")
 
 
+def _is_multicluster_test(item: pytest.Item) -> bool:
+    """Check if test is a multicluster test by looking at its path."""
+    if "multicluster" in str(getattr(item, "fspath", "")):
+        return True
+    return "multicluster" in getattr(item, "nodeid", "")
+
+
+def _extract_base_pattern(module_label: str) -> str:
+    """Extract session part of module_label (testrun-<user>--<sess>) for matching."""
+    base_pattern = module_label
+    if "--" in module_label:
+        prefix, suffix = module_label.split("--", 1)
+        base_pattern = f"{prefix}--{suffix.split('-')[0]}"
+    return base_pattern
+
+
+def _get_clusters(item: pytest.Item, testconfig) -> list[tuple[str, object]]:
+    """Get cluster clients for this test (single-cluster or multicluster)."""
+    clusters = [("cluster1", testconfig["control_plane"]["cluster"])]
+    if _is_multicluster_test(item):
+        for name in ("cluster2", "cluster3"):
+            client = testconfig["control_plane"].get(name)
+            if client:
+                clusters.append((name, client))
+    return clusters
+
+
+def _safe_collection_name(item: pytest.Item, module_label: str) -> str:
+    """Build a filesystem-safe base filename from the test nodeid.
+
+    nodeid: testsuite/tests/.../test_auth_credentials.py::test_custom_selector[authorizationHeader]
+    -> <module_label>-test_auth_credentials_test_custom_selector(authorizationHeader)
+    """
+    nodeid_parts = item.nodeid.split("::")
+    module_file = nodeid_parts[0].split("/")[-1].replace(".py", "")
+    test_part = nodeid_parts[1] if len(nodeid_parts) > 1 else item.name
+    name = f"{module_label}-{module_file}_{test_part}"
+    return name.replace("[", "(").replace("]", ")").replace("/", "_").replace("\\", "_")
+
+
+def _write_resource_files(matched: list, base_pattern: str, prefix: str) -> None:
+    """Write the apply (reproducible) and full (with status) YAML views for the matched resources."""
+    full_resources = [resource_collector.strip_full(r) for r in matched]
+    resource_collector.write_yaml(resource_collector.OUTPUT_DIR / f"{prefix}-full.yaml", base_pattern, full_resources)
+
+    apply_resources = [resource_collector.strip_apply(r) for r in matched if resource_collector.is_applyable(r)]
+    resource_collector.write_yaml(resource_collector.OUTPUT_DIR / f"{prefix}-apply.yaml", base_pattern, apply_resources)
+
+
+def _do_collection(item: pytest.Item, module_label: str, base_pattern: str, project: str, clusters: list) -> None:
+    """Orchestrate resource collection from clusters."""
+    try:
+        resource_collector.OUTPUT_DIR.mkdir(exist_ok=True)
+        safe_name = _safe_collection_name(item, module_label)
+        multicluster = len(clusters) > 1
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        for cluster_name, cluster_client in clusters:
+            try:
+                with cluster_client.context:
+                    resource_types = resource_collector.discover_resource_types()
+                    if not resource_types:
+                        pytest.skip(f"No resource types discovered for {cluster_name}")
+
+                    matched = resource_collector.collect_matching(project, base_pattern, resource_types)
+                    prefix = f"{safe_name}-{cluster_name}" if multicluster else safe_name
+                    _write_resource_files(matched, base_pattern, f"{prefix}-{timestamp}")
+            except resource_collector.COLLECTION_ERRORS:
+                pytest.skip(f"Failed to collect resources from {cluster_name}")
+    except resource_collector.COLLECTION_ERRORS:
+        pass
+
+
 @pytest.fixture(scope="function", autouse=True)
-def collect_test_resources(request, module_label):
-    """Collect module resources after all tests in the module finish."""
+def collect_test_resources(request, module_label, testconfig):
+    """Collect K8s resources to debug-resources/ (*-apply.yaml and *-full.yaml per test)."""
     yield
-    collect_resources(request.node, module_label)
+
+    if not request.config.getoption("--collect-resources"):
+        return
+
+    nodeid = request.node.nodeid
+    if nodeid in resource_collector.collected_nodes:
+        return
+
+    try:
+        project = testconfig["service_protection"]["project"]
+        clusters = _get_clusters(request.node, testconfig)
+        base_pattern = _extract_base_pattern(module_label)
+        _do_collection(request.node, module_label, base_pattern, project, clusters)
+        resource_collector.collected_nodes.add(nodeid)
+    except (KeyError, resource_collector.COLLECTION_ERRORS):
+        pass
 
 
 @pytest.fixture(autouse=True)

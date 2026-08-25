@@ -1,34 +1,16 @@
-"""
-Collects Kubernetes resources created during a test run for debugging.
+"""Helper functions for Kubernetes resource collection, filtering, and YAML output."""
 
-Enabled via pytest --collect-resources flag. Resources are matched by the
-testrun label pattern (e.g. testrun-user--xyz) in their metadata name or labels,
-and saved to debug-resources/ as YAML files stripped of cluster-managed noise.
-
-## File Output:
-- **Single-cluster tests**: Creates `{module_label}-{test_name}-resources.yaml`
-- **Multicluster tests**: Creates separate files for each cluster:
-  - `{module_label}-{test_name}-cluster1-resources.yaml`
-  - `{module_label}-{test_name}-cluster2-resources.yaml`
-
-Note: Collection runs per test function (not per module) because the collecting fixture
-must tear down before module-scoped fixtures clean up the resources. To avoid duplicate
-queries, each module is collected only once (on the first test) and subsequent tests skip.
-For parametrized tests, the filename contains the first parameter's name, but the file
-contains resources for all parameter combinations since they share module-scoped fixtures.
-"""
-
+import copy
 import logging
-import os
+from pathlib import Path
 
 import yaml
-from openshift_client import invoke
-
-from testsuite.config import settings
+from openshift_client import invoke, OpenShiftPythonException
 
 logger = logging.getLogger(__name__)
 
-# Resource types that inherit labels from parent resources and produce noise
+OUTPUT_DIR = Path("debug-resources")
+
 EXCLUDED_TYPES = frozenset(
     {
         "events",
@@ -37,149 +19,160 @@ EXCLUDED_TYPES = frozenset(
         "endpointslices.discovery.k8s.io",
         "leases.coordination.k8s.io",
         "controllerrevisions.apps",
+        "replicasets.apps",
         "pods.metrics.k8s.io",
     }
 )
 
+NON_APPLYABLE_KINDS = frozenset({"Pod", "ReplicaSet", "Endpoints", "EndpointSlice"})
 
-_collected_modules: set[str] = set()
+METADATA_NOISE = frozenset({"managedFields"})
 
+ANNOTATION_NOISE = frozenset({"kubectl.kubernetes.io/last-applied-configuration"})
 
-def _is_multicluster_test(item):
-    """Detect if this is a multicluster test by checking if 'multicluster' appears in the test path."""
-    if hasattr(item, "fspath") and "multicluster" in str(item.fspath):
-        return True
-    if hasattr(item, "nodeid") and "multicluster" in item.nodeid:
-        return True
-    return False
+SERVER_ASSIGNED_METADATA = frozenset(
+    {"uid", "resourceVersion", "generation", "creationTimestamp", "ownerReferences", "finalizers"}
+)
 
+COLLECTION_ERRORS = (OpenShiftPythonException, yaml.YAMLError, OSError, KeyError, RuntimeError)
 
-def collect_resources(item, module_label):
-    """Collect test resources from one or more clusters based on test type and configuration."""
-    if not item.config.getoption("--collect-resources"):
-        return
+MAX_DATA_VALUE_LEN = 64
 
-    # Extract base pattern from module label for resource matching
-    base_pattern = module_label
-    if "--" in module_label:
-        parts = module_label.split("--")
-        if len(parts) >= 2:
-            base_pattern = f"{parts[0]}--{parts[1].split('-')[0]}"
-
-    if module_label in _collected_modules:
-        return
-
-    # Determine clusters to collect from
-    clusters = [("cluster1", settings["control_plane"]["cluster"])]
-    if _is_multicluster_test(item) and settings["control_plane"].get("cluster2"):
-        clusters.append(("cluster2", settings["control_plane"]["cluster2"]))
-
-    success = _save_resources_from_clusters(item, module_label, base_pattern, clusters)
-    if success:
-        _collected_modules.add(module_label)
+# Node ids already collected, to skip reruns of the same test.
+collected_nodes: set[str] = set()
 
 
-def _discover_resource_types():
+def discover_resource_types() -> list[str]:
     """Discover all namespaced resource types available in the cluster."""
     result = invoke("api-resources", ["--namespaced=true", "--verbs=list", "-o", "name"])
     if result.status() != 0:
         return []
-    return [t.strip() for t in result.out().strip().split("\n") if t.strip() and t.strip() not in EXCLUDED_TYPES]
+    types = result.out().strip().split("\n")
+    return [t.strip() for t in types if t.strip() and t.strip() not in EXCLUDED_TYPES]
 
 
-def _save_resources_from_clusters(item, module_label, base_pattern, clusters):
-    """Save resources from specified clusters. Returns True on success."""
-    try:
-        project = settings["service_protection"]["project"]
-        os.makedirs("debug-resources", exist_ok=True)
-
-        safe_name = (
-            f"{module_label}-{item.name}".replace("[", "(").replace("]", ")").replace("/", "_").replace("\\", "_")
-        )
-
-        for cluster_name, cluster_client in clusters:
-            try:
-                with cluster_client.context:
-                    resource_types = _discover_resource_types()
-                    if not resource_types:
-                        logger.warning("No resource types discovered for %s, skipping", cluster_name)
-                        continue
-
-                    # Choose filename: single cluster uses plain name, multicluster adds cluster suffix
-                    if len(clusters) == 1:
-                        output_file = f"debug-resources/{safe_name}-resources.yaml"
-                    else:
-                        output_file = f"debug-resources/{safe_name}-{cluster_name}-resources.yaml"
-
-                    _save_matching_resources(
-                        project=project,
-                        base_pattern=base_pattern,
-                        resource_types=resource_types,
-                        output_file=output_file,
-                    )
-            except Exception:  # pylint: disable=broad-exception-caught
-                logger.warning("Failed to collect resources from %s", cluster_name, exc_info=True)
-
-        return True
-
-    except Exception:  # pylint: disable=broad-exception-caught
-        logger.warning("Resource collection failed", exc_info=True)
-        return False
-
-
-# Metadata fields managed by cluster that add noise to debugging output
-METADATA_NOISE = {"resourceVersion", "uid", "creationTimestamp", "generation", "managedFields", "annotations"}
-
-
-def _strip_resource(resource):
-    """Keep only fields useful for debugging: apiVersion, kind, metadata (name+labels+namespace), spec, status."""
-    stripped = {}
-    for key in ("apiVersion", "kind"):
-        if key in resource:
-            stripped[key] = resource[key]
-
-    metadata = resource.get("metadata", {})
-    stripped["metadata"] = {k: v for k, v in metadata.items() if k not in METADATA_NOISE}
-
-    for key in ("spec", "status"):
-        if key in resource:
-            stripped[key] = resource[key]
-
-    return stripped
-
-
-def _matches_metadata(resource, base_pattern):
+def matches_metadata(resource, base_pattern) -> bool:
     """Check if base_pattern appears in resource name or label values."""
     metadata = resource.get("metadata", {})
-    name = metadata.get("name", "")
-    if base_pattern in name:
+    if base_pattern in metadata.get("name", ""):
         return True
-    labels = metadata.get("labels", {})
-    return any(base_pattern in str(v) for v in labels.values())
+    return any(base_pattern in str(v) for v in metadata.get("labels", {}).values())
 
 
-def _save_matching_resources(project, base_pattern, resource_types, output_file):
-    """Fetch all resources and save those matching the base_pattern in metadata."""
-    matching_resources = []
-
+def collect_matching(project, base_pattern, resource_types) -> list[dict]:
+    """Fetch all resources of the given types and return raw dicts matching base_pattern."""
     result = invoke("get", [",".join(resource_types), "--ignore-not-found", "-n", project, "-o", "yaml"])
-
     if result.status() != 0:
         raise RuntimeError(f"Resource query failed: {result.err()}")
 
-    if result.out().strip():
-        try:
-            data = yaml.safe_load(result.out())
-        except yaml.YAMLError as e:
-            raise RuntimeError(f"YAML parsing failed: {e}") from e
-        items = data.get("items", [data]) if data else []
-        for item in items:
-            if _matches_metadata(item, base_pattern):
-                matching_resources.append(_strip_resource(item))
+    out = result.out().strip()
+    if not out:
+        return []
+    data = yaml.safe_load(out)
+    if not data:
+        return []
+    items = data.get("items", [data])
+    return [item for item in items if matches_metadata(item, base_pattern)]
 
+
+def is_applyable(resource) -> bool:
+    """Whether a resource belongs in the apply-able file.
+
+    Controller-managed resources (those with ownerReferences, e.g. the Istio
+    Deployment/Service/ServiceAccount generated for a Gateway) and non-applyable
+    kinds (Pods, ReplicaSets) are recreated by their controllers, so they are
+    excluded - only resources a user would recreate directly are kept. Using
+    ownerReferences is more reliable than labels, which controllers often copy
+    from the parent resource onto their generated children.
+    """
+    if resource.get("kind") in NON_APPLYABLE_KINDS:
+        return False
+    return not resource.get("metadata", {}).get("ownerReferences")
+
+
+def truncate_data(resource) -> None:
+    """Truncate certificate/key payloads; keep config intact for reproducibility."""
+    kind = resource.get("kind")
+    if kind not in ("Secret", "ConfigMap"):
+        return
+    for field in ("data", "stringData"):
+        data = resource.get(field)
+        if not isinstance(data, dict):
+            continue
+        for key, value in data.items():
+            if not isinstance(value, str):
+                continue
+            if "BEGIN" in value or (kind == "Secret" and len(value) > MAX_DATA_VALUE_LEN):
+                data[key] = f"<stripped: {len(value)} chars>"
+
+
+def strip_cluster_assigned(resource) -> None:
+    """Strip cluster-assigned Service fields (clusterIP, nodePort, LB annotations)."""
+    if resource.get("kind") != "Service":
+        return
+    spec = resource.get("spec")
+    if isinstance(spec, dict):
+        for key in ("clusterIP", "clusterIPs", "healthCheckNodePort"):
+            spec.pop(key, None)
+        for port in spec.get("ports", []):
+            if isinstance(port, dict):
+                port.pop("nodePort", None)
+    annotations = resource.get("metadata", {}).get("annotations")
+    if isinstance(annotations, dict):
+        for key in [k for k in annotations if k.startswith("loadbalancer.")]:
+            annotations.pop(key, None)
+
+
+def strip_full(resource) -> dict:
+    """Full view: drop managedFields, keep status and cluster metadata."""
+    resource = copy.deepcopy(resource)
+    metadata = resource.get("metadata")
+    if isinstance(metadata, dict):
+        for key in METADATA_NOISE:
+            metadata.pop(key, None)
+        annotations = metadata.get("annotations")
+        if isinstance(annotations, dict):
+            for key in ANNOTATION_NOISE:
+                annotations.pop(key, None)
+            if not annotations:
+                metadata.pop("annotations", None)
+    truncate_data(resource)
+    return resource
+
+
+def strip_apply(resource) -> dict:
+    """Apply view: no status, no server/cluster-assigned metadata."""
+    resource = strip_full(resource)
+    resource.pop("status", None)
+    metadata = resource.get("metadata")
+    if isinstance(metadata, dict):
+        for key in SERVER_ASSIGNED_METADATA:
+            metadata.pop(key, None)
+    strip_cluster_assigned(resource)
+    return resource
+
+
+class _BlockDumper(yaml.SafeDumper):
+    """YAML dumper that renders multiline strings as readable block scalars."""
+
+
+def _represent_str(dumper, data):
+    style = "|" if "\n" in data else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+_BlockDumper.add_representer(str, _represent_str)
+
+
+def write_yaml(output_file: Path, base_pattern, resources) -> None:
+    """Write stripped resources to a YAML file, one document per resource."""
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(f"# Resources from the testrun: {base_pattern}\n---\n")
-        if matching_resources:
-            f.write("\n---\n".join(yaml.dump(r, default_flow_style=False) for r in matching_resources))
+        if resources:
+            f.write(
+                "\n---\n".join(
+                    yaml.dump(r, Dumper=_BlockDumper, default_flow_style=False, sort_keys=False) for r in resources
+                )
+            )
         else:
             f.write("# No matching resources found\n")
