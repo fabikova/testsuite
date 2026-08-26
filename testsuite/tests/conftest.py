@@ -1,5 +1,6 @@
 """Root conftest"""
 
+import logging
 import operator
 import signal
 from datetime import datetime
@@ -27,6 +28,8 @@ from testsuite.tracing.tempo import RemoteTempoClient
 from testsuite.utils import randomize, _whoami
 from testsuite.utils import resource_collector
 
+logger = logging.getLogger(__name__)
+
 
 def pytest_addoption(parser):
     """Add options to include various kinds of tests in testrun"""
@@ -41,7 +44,13 @@ def pytest_addoption(parser):
         "--collect-resources",
         action="store_true",
         default=False,
-        help="Collect and save all test resources to debug-resources/",
+        help="Collect and save all test resources to debug-resources/ (or $WORKSPACE/debug-resources/)",
+    )
+    parser.addoption(
+        "--collect-resources-on-failure",
+        action="store_true",
+        default=False,
+        help="Collect and save test resources only for failed tests",
     )
 
 
@@ -132,7 +141,7 @@ def _write_rerun_properties(item, report):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Add jira link to html report and record rerun count for JUnit XML."""
+    """Add jira link to html report, record rerun count, and collect cluster resources."""
     pytest_html = item.config.pluginmanager.getplugin("html")
     outcome = yield
     report = outcome.get_result()
@@ -151,6 +160,7 @@ def pytest_runtest_makereport(item, call):
         _collect_rerun_attempt(item, call, report)
     if report.when == "teardown":
         _write_rerun_properties(item, report)
+    _try_collect_resources(item, report)
 
 
 def pytest_report_header(config):
@@ -502,57 +512,79 @@ def _safe_collection_name(item: pytest.Item, module_label: str) -> str:
 
 def _write_resource_files(matched: list, base_pattern: str, prefix: str) -> None:
     """Write the apply (reproducible) and full (with status) YAML views for the matched resources."""
+    out = resource_collector.output_dir()
     full_resources = [resource_collector.strip_full(r) for r in matched]
-    resource_collector.write_yaml(resource_collector.OUTPUT_DIR / f"{prefix}-full.yaml", base_pattern, full_resources)
+    resource_collector.write_yaml(out / f"{prefix}-full.yaml", base_pattern, full_resources)
 
     apply_resources = [resource_collector.strip_apply(r) for r in matched if resource_collector.is_applyable(r)]
-    resource_collector.write_yaml(resource_collector.OUTPUT_DIR / f"{prefix}-apply.yaml", base_pattern, apply_resources)
+    resource_collector.write_yaml(out / f"{prefix}-apply.yaml", base_pattern, apply_resources)
 
 
 def _do_collection(item: pytest.Item, module_label: str, base_pattern: str, project: str, clusters: list) -> None:
     """Orchestrate resource collection from clusters."""
+    out = resource_collector.output_dir()
+    out.mkdir(parents=True, exist_ok=True)
+    safe_name = _safe_collection_name(item, module_label)
+    multicluster = len(clusters) > 1
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    for cluster_name, cluster_client in clusters:
+        try:
+            with cluster_client.context:
+                resource_types = resource_collector.discover_resource_types()
+                if not resource_types:
+                    logger.warning("No resource types discovered for %s", cluster_name)
+                    continue
+
+                matched = resource_collector.collect_matching(project, base_pattern, resource_types)
+                prefix = f"{safe_name}-{cluster_name}" if multicluster else safe_name
+                _write_resource_files(matched, base_pattern, f"{prefix}-{timestamp}")
+        except resource_collector.COLLECTION_ERRORS:
+            logger.warning("Failed to collect resources from %s", cluster_name, exc_info=True)
+
+
+def _should_collect_resources(item: pytest.Item, report) -> bool:
+    """Whether this report phase should dump cluster resources."""
+    if report.when not in ("call", "setup") or report.skipped:
+        return False
+    if item.config.getoption("--collect-resources"):
+        # After a completed call, or when setup failed (call never runs).
+        return report.when == "call" or report.failed
+    if item.config.getoption("--collect-resources-on-failure"):
+        # Final failures only; rerun attempts have outcome "rerun", not failed.
+        return report.failed
+    return False
+
+
+def _try_collect_resources(item: pytest.Item, report) -> None:
+    """Dump cluster resources for this test when collection is enabled."""
+    if not _should_collect_resources(item, report):
+        return
+
+    nodeid = item.nodeid
+    if nodeid in resource_collector.collected_nodes:
+        return
+
+    ctx = getattr(item, "resource_collection_ctx", None)
+    if ctx is None:
+        logger.warning("Skipping resource collection for %s: fixtures not available", nodeid)
+        return
+
+    module_label, testconfig = ctx
     try:
-        resource_collector.OUTPUT_DIR.mkdir(exist_ok=True)
-        safe_name = _safe_collection_name(item, module_label)
-        multicluster = len(clusters) > 1
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-
-        for cluster_name, cluster_client in clusters:
-            try:
-                with cluster_client.context:
-                    resource_types = resource_collector.discover_resource_types()
-                    if not resource_types:
-                        pytest.skip(f"No resource types discovered for {cluster_name}")
-
-                    matched = resource_collector.collect_matching(project, base_pattern, resource_types)
-                    prefix = f"{safe_name}-{cluster_name}" if multicluster else safe_name
-                    _write_resource_files(matched, base_pattern, f"{prefix}-{timestamp}")
-            except resource_collector.COLLECTION_ERRORS:
-                pytest.skip(f"Failed to collect resources from {cluster_name}")
+        project = testconfig["service_protection"]["project"]
+        clusters = _get_clusters(item, testconfig)
+        base_pattern = _extract_base_pattern(module_label)
+        _do_collection(item, module_label, base_pattern, project, clusters)
+        resource_collector.collected_nodes.add(nodeid)
     except resource_collector.COLLECTION_ERRORS:
-        pass
+        logger.warning("Resource collection failed for %s", nodeid, exc_info=True)
 
 
 @pytest.fixture(scope="function", autouse=True)
 def collect_test_resources(request, module_label, testconfig):
-    """Collect K8s resources to debug-resources/ (*-apply.yaml and *-full.yaml per test)."""
-    yield
-
-    if not request.config.getoption("--collect-resources"):
-        return
-
-    nodeid = request.node.nodeid
-    if nodeid in resource_collector.collected_nodes:
-        return
-
-    try:
-        project = testconfig["service_protection"]["project"]
-        clusters = _get_clusters(request.node, testconfig)
-        base_pattern = _extract_base_pattern(module_label)
-        _do_collection(request.node, module_label, base_pattern, project, clusters)
-        resource_collector.collected_nodes.add(nodeid)
-    except (KeyError, resource_collector.COLLECTION_ERRORS):
-        pass
+    """Stash fixtures used to dump cluster resources after the test call."""
+    request.node.resource_collection_ctx = (module_label, testconfig)
 
 
 @pytest.fixture(autouse=True)

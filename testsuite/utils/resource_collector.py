@@ -2,6 +2,7 @@
 
 import copy
 import logging
+import os
 from pathlib import Path
 
 import yaml
@@ -9,7 +10,14 @@ from openshift_client import invoke, OpenShiftPythonException
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_DIR = Path("debug-resources")
+
+def output_dir() -> Path:
+    """Directory for collected YAML files.
+
+    Uses $WORKSPACE when set (Tekton shared workspace), otherwise the current directory.
+    """
+    return Path(os.environ.get("WORKSPACE", ".")) / "debug-resources"
+
 
 EXCLUDED_TYPES = frozenset(
     {
